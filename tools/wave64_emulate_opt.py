@@ -896,7 +896,7 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
             return False, _EMPTY_MEM_STATS, 0, (), ()
         flags = m[8]
         # 1. Strictly forbidden opcodes inside a lane-local folded region (cross-lane, barrier, unmasked writes).
-        if flags & _FLAG_FORBIDDEN_FOLD or _vcc_pair_collects_mask(ins, lane_masks):
+        if flags & _FLAG_FORBIDDEN_FOLD or _vcc_pair_collects_mask(ins, lane_masks) or ins.get("sop2_mask_word_sources"):
             return False, _EMPTY_MEM_STATS, 0, (), ()
 
         acc = m[9]
@@ -1470,7 +1470,7 @@ def _insn_may_barrier_with_meta(ins, meta, lane_masks, scc_live):
     if meta[1]:
         return False
     flags = meta[8]
-    if flags & _FLAG_ALWAYS_BARRIER or _vcc_pair_collects_mask(ins, lane_masks):
+    if flags & _FLAG_ALWAYS_BARRIER or _vcc_pair_collects_mask(ins, lane_masks) or ins.get("sop2_mask_word_sources"):
         return True
     mask_chk = meta[11]
     if not mask_chk:

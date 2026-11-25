@@ -6123,13 +6123,15 @@ class Gen:
         """The two sources of a 32-bit SOP2. A bitwise op (or s_cselect) that writes EXEC / VCC reads both through
         _mask_b32_src / mask_src (in wave32 and on either half of a wave64 mask), so a constant, inline or held in
         an SGPR, gives each lane its own bit; a mask is read as before. Until 2026-11-22 a constant was used whole:
-        `s_and_b32 exec_lo, exec_lo, 0xff00` (or the same constant in an SGPR) left every lane of EXEC on. An SGPR
-        destination stays a data read, because lane_masks.py classifies it as data when the other operand is a
-        constant (s_and_b32 s20, exec_lo, 1; s_bcnt1_i32_b32 s21, s20 gave 32 and 0 instead of 1, #1792)."""
+        `s_and_b32 exec_lo, exec_lo, 0xff00` (or the same constant in an SGPR) left every lane of EXEC on. A
+        plain scalar data result instead reads every mask operand as a complete 32-bit word."""
         if op in self.MASK_SOP2_B32 and len(a) >= 3:
             to_mask, dst_half = self._mask_b32_dst_half(a[0], a[1:3])
             if to_mask and all(self._maskable_b32(x) for x in a[1:3]):
                 return self._mask_b32_src(a[1], dst_half), self._mask_b32_src(a[2], dst_half)
+            words = self.cur_ins.get("sop2_mask_word_sources", ())
+            if words:
+                return tuple(self.lane_mask_word(s) if i in words else self.src_u(s) for i, s in enumerate(a[1:3], 1))
         return self.src_u(a[1]), self.src_u(a[2])
 
     def scc_logic(self, a, r):
@@ -6142,7 +6144,7 @@ class Gen:
         mask_srcs = [s for s in srcs if self.holds_lane_mask(s)]
         if to_mask_dst:
             self.scc_any_half(r, dst_half)
-        elif mask_srcs:
+        elif mask_srcs and not self.cur_ins.get("sop2_mask_word_sources"):
             if not self.wave64:
                 self.scc_from_mask(r)
             else:
@@ -6164,6 +6166,19 @@ class Gen:
         wave64_emulate_opt.mark_vcc_data_moves(*blocks)
         self.lane_masks, self.mask_writes, self.lane_either = lane_masks.analyse(*blocks, include_either=True,
                                                                                 wave64=self.wave64)
+        # Match the data result in lane_masks.step. The gather also needs to be visible to the
+        # wave64-emulation planner before it chooses where workgroup exchanges can run.
+        for block in blocks[0]:
+            for ins in block:
+                args = ins["args"]
+                if len(args) != 3 or args[0]["k"] != "sgpr" or base_op(ins["op"]) not in self.MASK_SOP2_B32:
+                    continue
+                state = dict.fromkeys(self.lane_either.get(id(ins), ()), lane_masks.EITHER)
+                state.update(self.lane_masks.get(id(ins), {}))
+                kinds = [lane_masks.kind(state, src, self.wave64) for src in args[1:]]
+                if None in kinds and any(kind in lane_masks.MASK_KINDS for kind in kinds):
+                    ins["sop2_mask_word_sources"] = tuple(i for i, kind in enumerate(kinds, 1)
+                                                          if kind in lane_masks.MASK_KINDS)
         # lane_masks merges a mask on one path with plain data on another by dropping the register,
         # so "not in cur_masks" does not prove it is data on every path. Keep a conservative set.
         self.ever_mask = {r for m in self.lane_masks.values() for r in m if isinstance(r, int)}
