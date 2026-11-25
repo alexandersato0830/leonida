@@ -14,8 +14,8 @@
 // can collide with (an encoded name never starts with '.'). Names ending in '~' are temporary files of an update in
 // progress; an encoded name never ends in '~' either.
 //
-// An update buffers its writes and deletes; SubmitUpdate writes every new blob to "<blob>~", then renames each over
-// its blob and removes the deleted ones, so a failed write leaves the container as it was.
+// SubmitUpdate stages the whole update and its undo records in a private directory beside the blobs. An interrupted
+// update is rolled back before a caller can see the container, and a completed update keeps its new files.
 //
 // ASSUMPTION (no executable yet): the quota is a fixed 1 GiB (the GDK says the per-user quota "is not a fixed size");
 // a blob name is at most 256 bytes (GS_MAX_BLOB_NAME_SIZE is not on the public pages); GetContainerInfo of a
@@ -36,6 +36,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -44,6 +45,10 @@
 #include <XAsync.h>
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
+
+#ifdef LEONIDA_GAMESAVE_TEST
+void gamesave_test_commit_step();
+#endif
 
 namespace {
 
@@ -180,6 +185,29 @@ fs::path save_root() {
 // One mutex for the handle sets and the files: saves are small and rare, so nothing is gained by finer locking.
 std::recursive_mutex g_mutex;
 
+// All processes using this save folder serialize their file operations. Callbacks run outside this lock, so they
+// can re-enter the shim. Windows releases the byte-range lock when its owner exits, even during a commit.
+class SaveFolderLock {
+public:
+    explicit SaveFolderLock(const fs::path& user_dir) :
+        file_(CreateFileW((user_dir / L".gamesave-lock").c_str(), GENERIC_READ | GENERIC_WRITE,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr)) {
+        locked_ = file_ != INVALID_HANDLE_VALUE && LockFileEx(file_, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &range_);
+    }
+    ~SaveFolderLock() {
+        if (locked_) UnlockFileEx(file_, 0, 1, 0, &range_);
+        if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+    }
+    SaveFolderLock(const SaveFolderLock&) = delete;
+    SaveFolderLock& operator=(const SaveFolderLock&) = delete;
+    explicit operator bool() const { return locked_; }
+
+private:
+    HANDLE file_;
+    OVERLAPPED range_{};
+    bool locked_ = false;
+};
+
 struct XGameSaveProvider {
     fs::path user_dir;   // <root>\local-user
     std::string config_id;
@@ -266,6 +294,59 @@ bool write_file(const fs::path& p, const void* data, size_t size) {
     return !f.fail();
 }
 
+constexpr auto kUpdateDirectory = L".gamesave-update~";
+constexpr auto kApplying = L".applying";
+
+bool move_file(const fs::path& from, const fs::path& to) {
+    return MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+}
+
+bool remove_file(const fs::path& path) {
+    std::error_code ec;
+    fs::remove(path, ec);
+    return !ec;
+}
+
+bool rollback_step(const fs::path& entry, const fs::path& final) {
+    std::error_code ec;
+    const fs::path deleted = entry / L"deleted";
+    if (fs::exists(deleted, ec)) return move_file(deleted, final);
+    if (ec) return false;
+    const bool pending_write = fs::exists(entry / L"new", ec);
+    if (ec || pending_write) return !ec;
+    const fs::path old = entry / L"old";
+    if (fs::exists(old, ec)) return move_file(old, final);
+    if (ec) return false;
+    const bool created = fs::exists(entry / L"created", ec);
+    return !ec && (!created || remove_file(final));
+}
+
+// No blob changes before the applying marker exists. After that, a moved-away "new" means a write was applied,
+// and a "deleted" file means a delete was applied. Moving an undo file back consumes it atomically, so recovery can
+// itself be interrupted. Clear the marker before removing scratch files so cleanup cannot make a commit partial.
+bool recover_update(const fs::path& dir) {
+    const fs::path journal = dir / kUpdateDirectory;
+    const fs::path marker = journal / kApplying;
+    std::error_code ec;
+    const bool applying = fs::exists(marker, ec);
+    if (ec) return false;
+    if (applying) {
+        for (fs::directory_iterator it(journal, ec), end; !ec && it != end; it.increment(ec)) {
+            const fs::path entry = it->path();
+            const fs::path name = entry.filename();
+            if (name == kApplying) continue;
+            std::string decoded;
+            if ((name != L".display" && !decode_name(narrow(name.wstring()), decoded)) || !it->is_directory(ec) || ec)
+                return false;
+            if (!rollback_step(entry, dir / name)) return false;
+        }
+        if (ec || !remove_file(marker)) return false;
+    }
+    fs::remove_all(journal, ec);
+    // Without the marker these files are inert. A held scratch file can block a new commit, but a read is safe.
+    return true;
+}
+
 struct ContainerRecord {
     std::string name, display_name;
     uint32_t blob_count = 0;
@@ -286,32 +367,44 @@ ContainerRecord describe(const std::string& name, const fs::path& dir) {
     return r;
 }
 
-std::vector<ContainerRecord> list_containers(const fs::path& user_dir, std::string_view prefix) {
+std::optional<std::vector<ContainerRecord>> list_containers(const fs::path& user_dir, std::string_view prefix) {
     std::vector<ContainerRecord> out;
     std::error_code ec;
-    for (const auto& e : fs::directory_iterator(user_dir, ec)) {
-        if (!e.is_directory(ec)) continue;
+    for (fs::directory_iterator it(user_dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_directory(ec)) continue;
         std::string name;
-        if (!decode_name(narrow(e.path().filename().wstring()), name)) continue;
+        if (!decode_name(narrow(it->path().filename().wstring()), name)) continue;
         if (name.compare(0, prefix.size(), prefix) != 0) continue;
-        out.push_back(describe(name, e.path()));
+        if (!recover_update(it->path())) return std::nullopt;
+        out.push_back(describe(name, it->path()));
     }
+    if (ec) return std::nullopt;
     std::sort(out.begin(), out.end(), [](const ContainerRecord& a, const ContainerRecord& b) { return a.name < b.name; });
     return out;
 }
 
-uint64_t used_bytes(const fs::path& user_dir) {
+std::optional<uint64_t> used_bytes(const fs::path& user_dir) {
+    const auto containers = list_containers(user_dir, {});
+    if (!containers) return std::nullopt;
     uint64_t used = 0;
-    for (const ContainerRecord& c : list_containers(user_dir, {})) used += c.total_size;
+    for (const ContainerRecord& c : *containers) used += c.total_size;
     return used;
 }
 
-void enumerate_containers(const fs::path& user_dir, std::string_view prefix, void* context, ContainerInfoCallback cb) {
-    for (const ContainerRecord& c : list_containers(user_dir, prefix)) {
+HRESULT enumerate_containers(const fs::path& user_dir, std::string_view prefix, void* context, ContainerInfoCallback cb) {
+    std::optional<std::vector<ContainerRecord>> containers;
+    {
+        const SaveFolderLock disk_lock(user_dir);
+        if (!disk_lock) return E_GS_OUT_OF_LOCAL_STORAGE;
+        containers = list_containers(user_dir, prefix);
+    }
+    if (!containers) return E_GS_OUT_OF_LOCAL_STORAGE;
+    for (const ContainerRecord& c : *containers) {
         const XGameSaveContainerInfo info{c.name.c_str(), c.display_name.c_str(), c.blob_count, c.total_size,
                                           c.modified, false};
         if (!cb(&info, context)) break;
     }
+    return S_OK;
 }
 
 // ---- Reading blobs into the title's buffer ----
@@ -353,6 +446,8 @@ void pack(const std::vector<BlobRead>& blobs, void* buffer) {
 HRESULT read_blobs(const XGameSaveContainer* c, const char* const* names, uint32_t count, std::vector<BlobRead>& out) {
     out.clear();
     const fs::path dir = c->dir();
+    const SaveFolderLock disk_lock(c->user_dir);
+    if (!disk_lock || !recover_update(dir)) return E_GS_OUT_OF_LOCAL_STORAGE;
     std::vector<std::string> wanted;
     if (names) {
         for (uint32_t i = 0; i < count; ++i) {
@@ -372,65 +467,37 @@ HRESULT read_blobs(const XGameSaveContainer* c, const char* const* names, uint32
 
 // ---- Committing an update ----
 //
-// Every write goes to "<blob>~" first. Then each op, in name order, applies its change: the blob's file is copied to
-// its backup "<blob>~b~", then a write renames its temporary over the blob or a delete removes the blob. A blob never
-// leaves its name, so a process that dies midway leaves each blob under its name, old or new, as before. When an op
-// fails, the ops already applied are undone newest first (a blob that existed is copied back from its backup, one
-// that did not is removed), the scratch files are deleted and the update fails with E_GS_OUT_OF_LOCAL_STORAGE. A
-// backup whose restore failed is kept, so the old contents survive. Every scratch name ends in '~', which encode_name
-// never produces and decode_name rejects, so enumeration and the quota never count one. A commit first deletes the
-// temporaries of a commit that died midway. It leaves backups alone: one may be the only copy of a blob's old
-// contents. The next successful update of that blob replaces and then removes its backup.
-
 struct CommitStep {
-    fs::path final_path, temp, backup;
-    bool write = false;
-    bool existed = false;      // the blob had a file before the update; the backup is a copy of it
-    bool backed_up = false;    // this update wrote the backup
-    bool applied = false;      // the op took effect
-    bool keep_backup = false;  // its undo failed: the backup holds the only copy of the old contents
+    fs::path final_path, entry;
+    bool write, existed;
 };
 
-bool copy_blob(const fs::path& from, const fs::path& to) {
+bool stage_step(const fs::path& dir, const fs::path& name, bool write, const void* data, size_t size,
+                std::vector<CommitStep>& steps) {
+    const fs::path final = dir / name;
+    const fs::path entry = dir / kUpdateDirectory / name;
     std::error_code ec;
-    fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
-    return !ec;
-}
-
-// Undoes the applied steps among steps[0, upto), newest first. A step whose restore fails keeps its backup.
-void undo_steps(std::vector<CommitStep>& steps, size_t upto) {
-    for (size_t i = upto; i-- > 0;) {
-        CommitStep& s = steps[i];
-        if (!s.applied) continue;
-        std::error_code ec;
-        if (s.existed) {
-            if (copy_blob(s.backup, s.final_path)) {
-                s.applied = false;
-            } else {
-                s.keep_backup = true;
-            }
-        } else {
-            fs::remove(s.final_path, ec);
-            if (!ec) s.applied = false;
+    const bool existed = fs::exists(final, ec);
+    if (ec || (existed && !fs::is_regular_file(final, ec)) || !fs::create_directory(entry, ec)) return false;
+    if (write) {
+        if (!write_file(entry / L"new", data, size)) return false;
+        if (existed) {
+            if (!fs::copy_file(final, entry / L"old", ec)) return false;
+        } else if (!write_file(entry / L"created", "", 0)) {
+            return false;
         }
     }
-}
-
-// Deletes what the update left behind: the temporaries, and the backups it wrote itself that are not the only copy of
-// a blob's old contents.
-void remove_scratch(const std::vector<CommitStep>& steps) {
-    for (const CommitStep& s : steps) {
-        std::error_code ec;
-        fs::remove(s.temp, ec);
-        if (s.backed_up && !s.keep_backup) fs::remove(s.backup, ec);
-    }
+    steps.push_back({final, entry, write, existed});
+    return true;
 }
 
 HRESULT commit(XGameSaveUpdate* u) {
     XGameSaveContainer* c = u->container;
     const fs::path dir = c->dir();
     // The quota: what the container holds after the update, plus every other container.
-    uint64_t after = used_bytes(c->user_dir);
+    const auto used = used_bytes(c->user_dir);
+    if (!used) return E_GS_OUT_OF_LOCAL_STORAGE;
+    uint64_t after = *used;
     for (const auto& [name, op] : u->ops) {
         std::error_code ec;
         const fs::path p = dir / widen(encode_name(name));
@@ -442,54 +509,42 @@ HRESULT commit(XGameSaveUpdate* u) {
     std::error_code ec;
     fs::create_directories(dir, ec);
     if (ec) return E_GS_OUT_OF_LOCAL_STORAGE;
-    // Temporaries of a commit that died midway: never blobs, and nothing else uses these names. Backups are kept.
+    // Remove legacy temporaries. A legacy backup may still be the only copy of an old blob.
     for (const auto& e : fs::directory_iterator(dir, ec)) {
         std::error_code entry_ec;
         const std::wstring n = e.path().filename().wstring();
         if (n.ends_with(L"~") && !n.ends_with(L"~b~") && e.is_regular_file(entry_ec)) fs::remove(e.path(), entry_ec);
     }
 
+    const fs::path journal = dir / kUpdateDirectory;
+    if (!fs::create_directory(journal, ec)) return E_GS_OUT_OF_LOCAL_STORAGE;
+    const auto abort = [&]() {
+        // A failed restore leaves the marker and remaining backups for the next access to retry.
+        recover_update(dir);
+        return E_GS_OUT_OF_LOCAL_STORAGE;
+    };
     std::vector<CommitStep> steps;
-    steps.reserve(u->ops.size());
+    steps.reserve(u->ops.size() + u->has_display_name);
     for (const auto& [name, op] : u->ops) {
-        CommitStep s;
-        s.final_path = dir / widen(encode_name(name));
-        s.temp = s.final_path;
-        s.temp += L"~";
-        s.backup = s.final_path;
-        s.backup += L"~b~";
-        s.write = op.write;
-        std::error_code exists_ec;
-        s.existed = fs::is_regular_file(s.final_path, exists_ec);
-        if (op.write && !write_file(s.temp, op.data.data(), op.data.size())) {
-            std::error_code rm_ec;
-            for (const CommitStep& done : steps) fs::remove(done.temp, rm_ec);
-            fs::remove(s.temp, rm_ec);
-            return E_GS_OUT_OF_LOCAL_STORAGE;
-        }
-        steps.push_back(std::move(s));
+        if (!stage_step(dir, widen(encode_name(name)), op.write, op.data.data(), op.data.size(), steps)) return abort();
     }
-
-    for (size_t i = 0; i < steps.size(); ++i) {
-        CommitStep& s = steps[i];
-        bool ok = true;
-        if (s.existed) ok = s.backed_up = copy_blob(s.final_path, s.backup);
-        if (ok && s.write) {
-            ok = MoveFileExW(s.temp.c_str(), s.final_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-        } else if (ok && s.existed) {   // a delete
-            std::error_code rm_ec;
-            fs::remove(s.final_path, rm_ec);   // already gone is a delete that has nothing left to do
-            ok = !rm_ec;
-        }
-        if (!ok) {
-            undo_steps(steps, i);   // the failed op changed nothing: only the ops before it were applied
-            remove_scratch(steps);
-            return E_GS_OUT_OF_LOCAL_STORAGE;
-        }
-        s.applied = true;
+    if (u->has_display_name && !stage_step(dir, L".display", true, u->display_name.data(), u->display_name.size(), steps))
+        return abort();
+    const fs::path marker = journal / kApplying;
+    if (!write_file(marker, "", 0)) return abort();
+    for (const CommitStep& s : steps) {
+        const bool ok = s.write ? move_file(s.entry / L"new", s.final_path)
+                               : !s.existed || move_file(s.final_path, s.entry / L"deleted");
+        if (!ok) return abort();
+#ifdef LEONIDA_GAMESAVE_TEST
+        gamesave_test_commit_step();
+#endif
     }
-    remove_scratch(steps);
-    if (u->has_display_name) write_file(dir / L".display", u->display_name.data(), u->display_name.size());
+    if (!remove_file(marker)) return abort();
+#ifdef LEONIDA_GAMESAVE_TEST
+    gamesave_test_commit_step();
+#endif
+    fs::remove_all(journal, ec);
     return S_OK;
 }
 
@@ -521,8 +576,11 @@ HRESULT remaining_quota(XGameSaveProviderHandle p, int64_t* remaining) {
     if (!remaining) return E_POINTER;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
-    const uint64_t used = used_bytes(p->user_dir);
-    *remaining = used >= kQuotaBytes ? 0 : static_cast<int64_t>(kQuotaBytes - used);
+    const SaveFolderLock disk_lock(p->user_dir);
+    if (!disk_lock) return E_GS_OUT_OF_LOCAL_STORAGE;
+    const auto used = used_bytes(p->user_dir);
+    if (!used) return E_GS_OUT_OF_LOCAL_STORAGE;
+    *remaining = *used >= kQuotaBytes ? 0 : static_cast<int64_t>(kQuotaBytes - *used);
     return S_OK;
 }
 
@@ -530,6 +588,8 @@ HRESULT delete_container(XGameSaveProviderHandle p, const char* name) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
     if (!valid_container_name(name)) return E_GS_INVALID_CONTAINER_NAME;
+    const SaveFolderLock disk_lock(p->user_dir);
+    if (!disk_lock) return E_GS_OUT_OF_LOCAL_STORAGE;
     std::error_code ec;
     fs::remove_all(p->user_dir / widen(encode_name(name)), ec);
     return ec ? E_FAIL : S_OK;
@@ -538,6 +598,8 @@ HRESULT delete_container(XGameSaveProviderHandle p, const char* name) {
 HRESULT submit_update(XGameSaveUpdateHandle u) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_updates, u) || !live_as(g_containers, u->container, u->container_serial)) return E_GS_HANDLE_EXPIRED;
+    const SaveFolderLock disk_lock(u->container->user_dir);
+    if (!disk_lock) return E_GS_OUT_OF_LOCAL_STORAGE;
     return commit(u);
 }
 
@@ -751,9 +813,15 @@ HRESULT STDMETHODCALLTYPE save_container_info(void*, XGameSaveProviderHandle p, 
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
     if (!valid_container_name(name)) return E_GS_INVALID_CONTAINER_NAME;
     const fs::path dir = p->user_dir / widen(encode_name(name));
-    std::error_code ec;
-    if (!fs::is_directory(dir, ec)) return S_OK;
-    const ContainerRecord c = describe(name, dir);
+    ContainerRecord c;
+    {
+        const SaveFolderLock disk_lock(p->user_dir);
+        if (!disk_lock) return E_GS_OUT_OF_LOCAL_STORAGE;
+        std::error_code ec;
+        if (!fs::is_directory(dir, ec)) return S_OK;
+        if (!recover_update(dir)) return E_GS_OUT_OF_LOCAL_STORAGE;
+        c = describe(name, dir);
+    }
     const XGameSaveContainerInfo info{c.name.c_str(), c.display_name.c_str(), c.blob_count, c.total_size, c.modified,
                                       false};
     cb(&info, context);
@@ -765,8 +833,7 @@ HRESULT STDMETHODCALLTYPE save_enum_containers(void*, XGameSaveProviderHandle p,
     if (!cb) return E_INVALIDARG;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
-    enumerate_containers(p->user_dir, {}, context, cb);
-    return S_OK;
+    return enumerate_containers(p->user_dir, {}, context, cb);
 }
 
 // 15: HRESULT XGameSaveEnumerateContainerInfoByName(XGameSaveProviderHandle, const char* containerNamePrefix,
@@ -776,8 +843,7 @@ HRESULT STDMETHODCALLTYPE save_enum_containers_by_name(void*, XGameSaveProviderH
     if (!cb) return E_INVALIDARG;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
-    enumerate_containers(p->user_dir, prefix ? std::string_view(prefix) : std::string_view{}, context, cb);
-    return S_OK;
+    return enumerate_containers(p->user_dir, prefix ? std::string_view(prefix) : std::string_view{}, context, cb);
 }
 
 // 16: HRESULT XGameSaveCreateContainer(XGameSaveProviderHandle, const char* containerName, XGameSaveContainerHandle*).
@@ -809,7 +875,14 @@ HRESULT enumerate_blobs(XGameSaveContainerHandle c, std::string_view prefix, voi
     if (!cb) return E_INVALIDARG;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_containers, c)) return E_GS_HANDLE_EXPIRED;
-    for (const BlobFile& b : list_blobs(c->dir())) {
+    std::vector<BlobFile> blobs;
+    {
+        const SaveFolderLock disk_lock(c->user_dir);
+        const auto dir = c->dir();
+        if (!disk_lock || !recover_update(dir)) return E_GS_OUT_OF_LOCAL_STORAGE;
+        blobs = list_blobs(dir);
+    }
+    for (const BlobFile& b : blobs) {
         if (b.name.compare(0, prefix.size(), prefix) != 0) continue;
         const XGameSaveBlobInfo info{b.name.c_str(), static_cast<uint32_t>(b.size)};
         if (!cb(&info, context)) break;

@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -28,6 +29,8 @@ namespace {
 
 int g_checks = 0;
 int g_failures = 0;
+int g_exit_after_step = 0;
+constexpr DWORD kInterruptedExit = 77;
 
 void check(bool condition, const char* what) {
     ++g_checks;
@@ -118,9 +121,53 @@ bool CALLBACK on_blob(const BlobInfo* info, void* context) {
     return true;
 }
 
+int interrupt_update(int step) {
+    auto query = reinterpret_cast<Query>(rt::shims::find("xgameruntime.dll", "QueryApiImpl"));
+    if (!query) return 1;
+    void* save = nullptr;
+    Handle user = reinterpret_cast<Handle>(0x1000);
+    Handle provider = nullptr, container = nullptr, update = nullptr;
+    if (FAILED(query(&kSaveClass, kSaveClass, &save)) || !save ||
+        FAILED(at<Init>(save, 3)(save, user, "SCID", false, &provider)) ||
+        FAILED(at<Create>(save, 16)(save, provider, "interrupted", &container)) ||
+        FAILED(at<Create>(save, 23)(save, container, "NEXT_DISPLAY", &update))) return 1;
+    const auto next = reinterpret_cast<const uint8_t*>("NEXT_A");
+    const auto added = reinterpret_cast<const uint8_t*>("NEW_C");
+    if (FAILED(at<Write>(save, 25)(save, update, "a", next, 6)) ||
+        FAILED(at<ByName>(save, 26)(save, update, "b")) ||
+        FAILED(at<Write>(save, 25)(save, update, "c", added, 5))) return 1;
+    g_exit_after_step = step;
+    at<Submit>(save, 27)(save, update);
+    return 1;  // A working hook exits before SubmitUpdate can return.
+}
+
+bool run_interrupted_update(int step) {
+    wchar_t exe[MAX_PATH * 2];
+    const DWORD n = GetModuleFileNameW(nullptr, exe, static_cast<DWORD>(std::size(exe)));
+    if (!n || n == std::size(exe)) return false;
+    std::wstring command = L"\"" + std::wstring(exe, n) + L"\" --interrupt-update " + std::to_wstring(step);
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION child{};
+    if (!CreateProcessW(exe, command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &child))
+        return false;
+    CloseHandle(child.hThread);
+    const bool exited = WaitForSingleObject(child.hProcess, 10000) == WAIT_OBJECT_0;
+    DWORD code = 0;
+    if (exited) GetExitCodeProcess(child.hProcess, &code);
+    else TerminateProcess(child.hProcess, 1);
+    CloseHandle(child.hProcess);
+    return exited && code == kInterruptedExit;
+}
+
 }  // namespace
 
-int main() {
+void gamesave_test_commit_step() {
+    if (g_exit_after_step > 0 && --g_exit_after_step == 0) TerminateProcess(GetCurrentProcess(), kInterruptedExit);
+}
+
+int main(int argc, char** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "--interrupt-update") == 0) return interrupt_update(std::atoi(argv[2]));
     std::setvbuf(stdout, nullptr, _IONBF, 0);   // a crash still shows the checks before it
     std::printf("xgameruntime_gamesave_test: XGameSaveImpl through QueryApiImpl\n");
     const std::filesystem::path root = std::filesystem::temp_directory_path() / L"leonida_gamesave_test";
@@ -373,9 +420,9 @@ int main() {
             const char* name;
             const char* data;   // nullptr: delete
         };
-        auto submit = [&](Handle container, std::vector<Edit> edits) -> HRESULT {
+        auto submit = [&](Handle container, std::vector<Edit> edits, const char* display = nullptr) -> HRESULT {
             Handle u = nullptr;
-            HRESULT hr = at<Create>(save, 23)(save, container, nullptr, &u);
+            HRESULT hr = at<Create>(save, 23)(save, container, display, &u);
             for (const Edit& e : edits) {
                 if (FAILED(hr)) break;
                 hr = e.data ? at<Write>(save, 25)(save, u, e.name, reinterpret_cast<const uint8_t*>(e.data),
@@ -449,6 +496,64 @@ int main() {
         check(read_blob(rollback_dir, L"b~b~") == "KEPT_B", "the failed update keeps the backup it did not write");
 
         at<Close>(save, 17)(save, rc);
+
+        Handle interrupted = nullptr;
+        check(at<Create>(save, 16)(save, provider, "interrupted", &interrupted) == S_OK, "open interruption fixture");
+        const auto interrupted_dir = root / L"local-user" / L"interrupted";
+        check(submit(interrupted, {{"a", "OLD_A"}, {"b", "OLD_B"}}, "OLD_DISPLAY") == S_OK, "seed old generation");
+        auto verify_generation = [&](bool committed) {
+            alignas(Blob) uint8_t generation_buffer[256]{};
+            auto* generation_entries = reinterpret_cast<Blob*>(generation_buffer);
+            uint32_t generation_count = 0;
+            const auto hr = at<Read>(save, 20)(save, interrupted, nullptr, &generation_count, sizeof(generation_buffer),
+                                              generation_entries);
+            std::vector<std::string> generation_names, generation_data;
+            if (SUCCEEDED(hr)) {
+                for (uint32_t i = 0; i < generation_count; ++i) {
+                    generation_names.emplace_back(generation_entries[i].info.name);
+                    generation_data.emplace_back(reinterpret_cast<const char*>(generation_entries[i].data),
+                                                 generation_entries[i].info.size);
+                }
+            }
+            const auto expected_names = committed ? std::vector<std::string>{"a", "c"}
+                                                  : std::vector<std::string>{"a", "b"};
+            const auto expected_data = committed ? std::vector<std::string>{"NEXT_A", "NEW_C"}
+                                                 : std::vector<std::string>{"OLD_A", "OLD_B"};
+            check(hr == S_OK && generation_names == expected_names && generation_data == expected_data,
+                  committed ? "completed update keeps every new blob" : "interrupted update restores every old blob");
+            Seen generation_info;
+            const auto info = at<GetInfo>(save, 13)(save, provider, "interrupted", &generation_info, on_container);
+            const auto display = committed ? "NEXT_DISPLAY" : "OLD_DISPLAY";
+            check(info == S_OK && generation_info.displays == std::vector<std::string>{display} &&
+                      file_count(interrupted_dir) == 3,
+                  "readback includes the matching display name and no journal entries");
+        };
+
+        check(run_interrupted_update(1), "writer process exits after replacing only a");
+        check(read_blob(interrupted_dir, L"a") == "NEXT_A" && read_blob(interrupted_dir, L"b") == "OLD_B",
+              "the first interruption leaves mixed blobs on disk before recovery");
+        verify_generation(false);
+
+        check(run_interrupted_update(4), "writer process exits after the last change before commit");
+        check(!std::filesystem::exists(interrupted_dir / L"b") && read_blob(interrupted_dir, L"c") == "NEW_C" &&
+                  read_blob(interrupted_dir, L".display") == "NEXT_DISPLAY",
+              "deletion, creation and display change reached disk before recovery");
+        hold = CreateFileW((interrupted_dir / L"a").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+        check(hold != INVALID_HANDLE_VALUE, "hold a replacement open to block recovery");
+        {
+            alignas(Blob) uint8_t blocked_buffer[256]{};
+            uint32_t blocked_count = 0;
+            check(at<Read>(save, 20)(save, interrupted, nullptr, &blocked_count, sizeof(blocked_buffer),
+                                     reinterpret_cast<Blob*>(blocked_buffer)) == out_of_local,
+                  "read reports storage error while recovery cannot restore the old generation");
+        }
+        CloseHandle(hold);
+        verify_generation(false);
+
+        check(run_interrupted_update(5), "writer process exits just after committing and before cleanup");
+        verify_generation(true);
+        at<Close>(save, 17)(save, interrupted);
     }
 
     at<Close>(save, 6)(save, provider);
